@@ -10,29 +10,30 @@ const app = express();
 const port = process.env.PORT || 3000;
 const upload = multer({ storage: multer.memoryStorage() });
 
-// In-Memory Database (For prototype purposes. Will reset if server restarts)
 const patientsDB = {}; 
 
 app.get('/', (req, res) => {
     res.sendFile(path.join(__dirname, 'index.html'));
 });
 
-// ROUTE 1: Onboard Patient via Admission Paper
+// ROUTE 1: Onboard Patient
 app.post('/api/onboard', upload.single('document'), async (req, res) => {
     try {
         const { doctorContact } = req.body;
         if (!req.file || !doctorContact) return res.status(400).json({ error: 'Missing image or doctor contact.' });
 
-        // 1. Run AI OCR on the image
         const { data: { text } } = await Tesseract.recognize(req.file.buffer, 'eng');
         
-        // 2. Extract UHID (Assuming format is 'UHID' followed by numbers)
-        const uhidMatch = text.match(/UHID[\s-]?(\d+)/i);
-        if (!uhidMatch) return res.status(400).json({ error: 'Could not detect a valid UHID in this photo.' });
+        // NEW AI RULE: Looks for a standalone number between 6 and 12 digits long
+        const uhidMatch = text.match(/\b(\d{6,12})\b/);
         
-        const extractedUhid = `UHID-${uhidMatch[1]}`;
+        if (!uhidMatch) {
+            const aiSaw = text.replace(/\n/g, ' ').substring(0, 100);
+            return res.status(400).json({ error: `Could not find a 6-12 digit ID. AI read: "${aiSaw}"` });
+        }
+        
+        const extractedUhid = uhidMatch[1];
 
-        // 3. Save to our database
         patientsDB[extractedUhid] = {
             doctorContact: doctorContact,
             onboardedAt: new Date().toISOString()
@@ -40,7 +41,7 @@ app.post('/api/onboard', upload.single('document'), async (req, res) => {
 
         res.status(200).json({ 
             success: true, 
-            message: `Patient ${extractedUhid} onboarded securely.`
+            message: `Patient ID ${extractedUhid} onboarded securely.`
         });
 
     } catch (error) {
@@ -48,38 +49,37 @@ app.post('/api/onboard', upload.single('document'), async (req, res) => {
     }
 });
 
-// ROUTE 2: Auto-Scan & Route Lab Reports
+// ROUTE 2: Auto-Scan & Route
 app.post('/api/scan-report', upload.single('report'), async (req, res) => {
     try {
         if (!req.file) return res.status(400).json({ error: 'Missing report image.' });
 
-        // 1. Run AI OCR to find the UHID
         const { data: { text } } = await Tesseract.recognize(req.file.buffer, 'eng');
-        const uhidMatch = text.match(/UHID[\s-]?(\d+)/i);
         
-        if (!uhidMatch) return res.status(400).json({ error: 'Could not detect UHID. Ensure the ID is clearly visible.' });
-        const extractedUhid = `UHID-${uhidMatch[1]}`;
+        // NEW AI RULE: Looks for a standalone number between 6 and 12 digits long
+        const uhidMatch = text.match(/\b(\d{6,12})\b/);
+        
+        if (!uhidMatch) return res.status(400).json({ error: 'Could not detect the numeric ID.' });
+        
+        const extractedUhid = uhidMatch[1];
 
-        // 2. Check if patient exists in database
         const patientProfile = patientsDB[extractedUhid];
         if (!patientProfile) {
-            return res.status(404).json({ error: `UHID ${extractedUhid} recognized, but patient is not onboarded yet.` });
+            return res.status(404).json({ error: `ID ${extractedUhid} found, but patient is not onboarded.` });
         }
 
-        // 3. Upload Image to ImgBB
         const form = new FormData();
         form.append('image', req.file.buffer.toString('base64'));
         const imgbbResponse = await axios.post(`https://api.imgbb.com/1/upload?key=${process.env.IMGBB_KEY}`, form, { headers: form.getHeaders() });
         const imageUrl = imgbbResponse.data.data.url;
 
-        // 4. Send WhatsApp via Twilio
         const client = twilio(process.env.TWILIO_SID, process.env.TWILIO_TOKEN);
         const formattedNumber = patientProfile.doctorContact.startsWith('+') ? patientProfile.doctorContact : `+91${patientProfile.doctorContact}`;
 
         await client.messages.create({
             from: `whatsapp:${process.env.TWILIO_NUMBER}`,
             to: `whatsapp:${formattedNumber}`,
-            body: `🚨 *New Report Auto-Routed*\n\n*Patient UHID:* ${extractedUhid}\n\nReview attached report.`,
+            body: `🚨 *New Report Auto-Routed*\n\n*Patient ID:* ${extractedUhid}\n\nReview attached report.`,
             mediaUrl: [imageUrl]
         });
 
